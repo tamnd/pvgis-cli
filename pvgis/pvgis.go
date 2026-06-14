@@ -1,62 +1,187 @@
 // Package pvgis is the library behind the pvgis command line:
-// the HTTP client, request shaping, and the typed data models for pvgis.
+// the HTTP client, request shaping, and typed data models for the EU
+// Photovoltaic Geographical Information System API (re.jrc.ec.europa.eu).
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// PVGIS is a free EU-hosted service providing solar energy calculations for
+// any geographic coordinate. No API key or registration is required. The Client
+// paces requests, retries transient failures (429 and 5xx) with exponential
+// backoff, and decodes the JSON responses into clean typed structs.
+//
+// Two operations are provided: annual PV energy yield (PVCalc) and monthly
+// solar radiation data (Monthly).
 package pvgis
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"strconv"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to pvgis. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "pvgis/dev (+https://github.com/tamnd/pvgis-cli)"
+// Host is the site this client talks to.
+const Host = "re.jrc.ec.europa.eu"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at pvgis.com; change it once you
-// know the real endpoints you want to read.
-const Host = "pvgis.com"
+// BaseURL is the API base path.
+const BaseURL = "https://re.jrc.ec.europa.eu/api/v5_2"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to pvgis over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds tunable knobs for the HTTP client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
+// DefaultConfig returns sensible defaults for production use.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
+		UserAgent: "pvgis-cli/0.1.0 (github.com/tamnd/pvgis-cli)",
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Timeout:   60 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to re.jrc.ec.europa.eu over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client configured with cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// PVResult holds the annual PV energy yield for a location.
+type PVResult struct {
+	Latitude         float64 `json:"latitude"`
+	Longitude        float64 `json:"longitude"`
+	PeakPower        float64 `json:"peak_power_kw,omitempty"`
+	Loss             float64 `json:"loss_pct,omitempty"`
+	YearlyEnergy     float64 `json:"yearly_energy_kwh"`
+	DailyEnergy      float64 `json:"daily_energy_kwh"`
+	PerformanceRatio float64 `json:"performance_ratio"`
+}
+
+// MonthlyData holds solar radiation data for one calendar month.
+type MonthlyData struct {
+	Month      int     `json:"month"`
+	Radiation  float64 `json:"radiation_kwh_m2_day"` // H(i) irradiation on fixed plane
+	DirectRad  float64 `json:"direct_radiation,omitempty"`
+	DiffuseRad float64 `json:"diffuse_radiation,omitempty"`
+}
+
+// --- wire types ---
+
+type wirePVResp struct {
+	Inputs struct {
+		Location struct {
+			Latitude  float64 `json:"latitude"`
+			Longitude float64 `json:"longitude"`
+		} `json:"location"`
+	} `json:"inputs"`
+	Outputs struct {
+		Totals struct {
+			Fixed struct {
+				Ey float64 `json:"E_y"`
+				Ed float64 `json:"E_d"`
+				PR float64 `json:"PR"`
+			} `json:"fixed"`
+		} `json:"totals"`
+	} `json:"outputs"`
+}
+
+type wireMRResp struct {
+	Outputs struct {
+		Monthly []struct {
+			Month float64 `json:"month"`
+			Hi    float64 `json:"H(i)"`
+			HbI   float64 `json:"Hb(i)"`
+			HdI   float64 `json:"Hd(i)"`
+		} `json:"monthly"`
+	} `json:"outputs"`
+}
+
+// PVCalc returns the annual PV energy yield for the given coordinates.
+// peakPower is installed peak power in kWp; loss is system loss percentage.
+// angle is tilt in degrees; aspect is azimuth (0=south, -90=east, 90=west).
+func (c *Client) PVCalc(ctx context.Context, lat, lon, peakPower, loss float64, angle, aspect int) (*PVResult, error) {
+	u := fmt.Sprintf(
+		"%s/PVcalc?lat=%s&lon=%s&peakpower=%s&loss=%s&angle=%d&aspect=%d&outputformat=json",
+		c.cfg.BaseURL,
+		strconv.FormatFloat(lat, 'f', -1, 64),
+		strconv.FormatFloat(lon, 'f', -1, 64),
+		strconv.FormatFloat(peakPower, 'f', -1, 64),
+		strconv.FormatFloat(loss, 'f', -1, 64),
+		angle,
+		aspect,
+	)
+	b, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var resp wirePVResp
+	if err := json.Unmarshal(b, &resp); err != nil {
+		return nil, fmt.Errorf("decode PVcalc response: %w", err)
+	}
+	return &PVResult{
+		Latitude:         resp.Inputs.Location.Latitude,
+		Longitude:        resp.Inputs.Location.Longitude,
+		PeakPower:        peakPower,
+		Loss:             loss,
+		YearlyEnergy:     resp.Outputs.Totals.Fixed.Ey,
+		DailyEnergy:      resp.Outputs.Totals.Fixed.Ed,
+		PerformanceRatio: resp.Outputs.Totals.Fixed.PR,
+	}, nil
+}
+
+// Monthly returns monthly solar radiation data for the given coordinates.
+// angle is tilt in degrees; aspect is azimuth (0=south).
+func (c *Client) Monthly(ctx context.Context, lat, lon float64, angle, aspect int) ([]MonthlyData, error) {
+	u := fmt.Sprintf(
+		"%s/MRcalc?lat=%s&lon=%s&angle=%d&aspect=%d&outputformat=json&mstartyear=2005&mendyear=2020",
+		c.cfg.BaseURL,
+		strconv.FormatFloat(lat, 'f', -1, 64),
+		strconv.FormatFloat(lon, 'f', -1, 64),
+		angle,
+		aspect,
+	)
+	b, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var resp wireMRResp
+	if err := json.Unmarshal(b, &resp); err != nil {
+		return nil, fmt.Errorf("decode MRcalc response: %w", err)
+	}
+	out := make([]MonthlyData, 0, len(resp.Outputs.Monthly))
+	for _, m := range resp.Outputs.Monthly {
+		out = append(out, MonthlyData{
+			Month:      int(m.Month),
+			Radiation:  m.Hi,
+			DirectRad:  m.HbI,
+			DiffuseRad: m.HdI,
+		})
+	}
+	return out, nil
+}
+
+// get fetches url and returns the response body. It paces and retries.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +189,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +198,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -106,10 +232,12 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 
 // pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -121,80 +249,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on pvgis.com. It is a stand-in for the typed records you
-// will model from the real pvgis endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `pvgis cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
