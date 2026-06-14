@@ -1,0 +1,10 @@
+title       = "pvgis"
+baseURL     = "https://pvgis-cli.tamnd.com/"
+description = "Fetch solar energy data from the EU PVGIS API."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/pvgis-cli"
